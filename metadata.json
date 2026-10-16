@@ -1,0 +1,6 @@
+{
+  "uuid": "topline@nox",
+  "name": "Topline",
+  "description": "Synced lyrics in the top bar",
+  "shell-version": ["50"]
+}

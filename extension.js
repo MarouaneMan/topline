@@ -1,5 +1,6 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import Pango from 'gi://Pango';
 import Soup from 'gi://Soup?version=3.0';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
@@ -19,6 +20,11 @@ const TICK_MS = 100;
 const NO_LINE = -2;
 const CACHE_MAX = 200;
 const LEAD_MS = 500; // show each line slightly before it's sung
+const LABEL_MAX_WIDTH = 600; // px, long titles are cut with "…"
+const LYRICS_MAX_HEIGHT = 400; // px, the popup scrolls past this
+const LYRICS_WIDTH = 450; // px, long lines wrap
+const LINE_STYLE = 'color: rgba(255, 255, 255, 0.5);';
+const CURRENT_LINE_STYLE = 'color: white; font-weight: bold;';
 
 const STATUS = {
   fetching: 'Looking for lyrics on LRCLIB…',
@@ -41,11 +47,45 @@ export default class ToplineExtension extends Extension {
   enable() {
     // false = create a dropdown menu (shows the status on click)
     this._button = new PanelMenu.Button(0.0, this.metadata.name, false);
-    this._label = new St.Label({ text: '', y_align: Clutter.ActorAlign.CENTER });
+    this._label = new St.Label({
+      text: '',
+      y_align: Clutter.ActorAlign.CENTER,
+      style: `max-width: ${LABEL_MAX_WIDTH}px;`,
+    });
+    this._label.clutter_text.ellipsize = Pango.EllipsizeMode.END;
     this._button.add_child(this._label);
 
+    // Shown when there are no synced lyrics
     this._statusItem = new PopupMenu.PopupMenuItem('', { reactive: false });
     this._button.menu.addMenuItem(this._statusItem);
+
+    // Shown instead of the status when synced lyrics are found
+    this._lyricsBox = new St.BoxLayout({
+      orientation: Clutter.Orientation.VERTICAL,
+      style: `width: ${LYRICS_WIDTH}px;`,
+    });
+    this._lyricsScroll = new St.ScrollView({
+      style: `max-height: ${LYRICS_MAX_HEIGHT}px;`,
+      hscrollbar_policy: St.PolicyType.NEVER,
+      vscrollbar_policy: St.PolicyType.AUTOMATIC,
+      child: this._lyricsBox,
+    });
+    this._lyricsItem = new PopupMenu.PopupBaseMenuItem({ reactive: false });
+    this._lyricsItem.add_child(this._lyricsScroll);
+    this._button.menu.addMenuItem(this._lyricsItem);
+    this._lyricsItem.hide();
+    this._lineLabels = [];
+
+    this._menuOpenId = this._button.menu.connect('open-state-changed', (_menu, open) => {
+      if (!open)
+        return;
+      // Wait for the labels to get their size and position first
+      this._scrollIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+        this._scrollIdleId = 0;
+        this._scrollToCurrentLine();
+        return GLib.SOURCE_REMOVE;
+      });
+    });
 
     Main.panel.addToStatusArea(this.uuid, this._button, 0, 'center');
     this._button.hide(); // shown when the first song settles
@@ -55,6 +95,7 @@ export default class ToplineExtension extends Extension {
     this._cache = new Map(); // cacheKey -> {lines, status}
     this._debounceId = 0;
     this._retryId = 0;
+    this._scrollIdleId = 0;
     this._pending = null;
     this._currentKey = null;
     this._playerBus = null;
@@ -99,11 +140,12 @@ export default class ToplineExtension extends Extension {
     const md = changed.Metadata;
     const title = md['xesam:title'];
     const artist = md['xesam:artist']?.[0];
+    const album = md['xesam:album'] ?? '';
     const lengthUs = md['mpris:length'] ?? 0;
     if (!title || !artist)
       return;
 
-    this._pending = { sender, artist, title, durationSec: Math.round(lengthUs / 1e6) };
+    this._pending = { sender, artist, title, album, durationSec: Math.round(lengthUs / 1e6) };
 
     if (this._debounceId)
       GLib.Source.remove(this._debounceId);
@@ -122,7 +164,17 @@ export default class ToplineExtension extends Extension {
     this._anchorTimeUs = GLib.get_monotonic_time();
   }
 
-  _onTrackSettled({ sender, artist, title, durationSec }) {
+  _onTrackSettled({ sender, artist, title, album, durationSec }) {
+    // Browsers expose one MPRIS player for all tabs, so a video on X or
+    // another site takes it over. Those have no album: ignore them.
+    if (!album.trim()) {
+      this._button.hide();
+      this._playerBus = null;
+      this._currentKey = null; // coming back to the same song is handled again
+      this._applyResult({ lines: [], status: '' });
+      return;
+    }
+
     this._button.show();
     this._playerBus = sender;
     this._resync(); // always: even the same song may have restarted
@@ -131,8 +183,7 @@ export default class ToplineExtension extends Extension {
     if (key === this._currentKey)
       return;
     this._currentKey = key;
-    this._lines = [];
-    this._lineIndex = NO_LINE;
+    this._applyResult({ lines: [], status: '' });
     this._label.text = `${artist} - ${title}`; // stays here if anything fails
 
     if (durationSec <= 0) {
@@ -154,6 +205,29 @@ export default class ToplineExtension extends Extension {
     this._lines = lines;
     this._lineIndex = NO_LINE;
     this._setStatus(fromCache ? `${status} (from cache)` : status);
+    this._buildLyrics(lines);
+  }
+
+  // Popup: full lyrics when we have them, the status otherwise
+  _buildLyrics(lines) {
+    this._lyricsBox.destroy_all_children();
+    this._lineLabels = lines.map(line => {
+      const label = new St.Label({ text: line.text || '♪', style: LINE_STYLE });
+      label.clutter_text.line_wrap = true;
+      this._lyricsBox.add_child(label);
+      return label;
+    });
+    this._lyricsItem.visible = lines.length > 0;
+    this._statusItem.visible = lines.length === 0;
+  }
+
+  _scrollToCurrentLine() {
+    const label = this._lineLabels[this._lineIndex];
+    if (!label)
+      return;
+    const adj = this._lyricsScroll.vadjustment;
+    const [, natHeight] = label.get_preferred_height(-1);
+    adj.value = label.y + natHeight / 2 - adj.page_size / 2; // clamped by the adjustment
   }
 
   _remember(cacheKey, result) {
@@ -257,9 +331,13 @@ export default class ToplineExtension extends Extension {
     const i = findLineIndex(this._lines, positionMs);
     if (i === this._lineIndex)
       return;
+    this._lineLabels[this._lineIndex]?.set_style(LINE_STYLE);
     this._lineIndex = i;
+    this._lineLabels[i]?.set_style(CURRENT_LINE_STYLE);
     const text = i >= 0 ? this._lines[i].text : '';
     this._label.text = text || '♪'; // instrumental part or before first line
+    if (this._button.menu.isOpen)
+      this._scrollToCurrentLine();
   }
 
   _sleep(ms) {
@@ -278,18 +356,24 @@ export default class ToplineExtension extends Extension {
         Gio.DBus.session.signal_unsubscribe(id);
     this._propsSignalId = this._seekedSignalId = 0;
 
-    for (const id of [this._debounceId, this._retryId, this._tickId])
+    for (const id of [this._debounceId, this._retryId, this._tickId, this._scrollIdleId])
       if (id)
         GLib.Source.remove(id);
-    this._debounceId = this._retryId = this._tickId = 0;
+    this._debounceId = this._retryId = this._tickId = this._scrollIdleId = 0;
 
     this._cancellable?.cancel();
     this._session?.abort();
     this._cancellable = this._session = null;
     this._cache = null;
 
+    if (this._menuOpenId)
+      this._button?.menu.disconnect(this._menuOpenId);
+    this._menuOpenId = 0;
+
     this._button?.destroy(); // also destroys the menu and its items
     this._button = this._label = this._statusItem = null;
+    this._lyricsItem = this._lyricsScroll = this._lyricsBox = null;
+    this._lineLabels = [];
   }
 }
 

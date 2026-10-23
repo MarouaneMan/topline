@@ -32,7 +32,9 @@ Play a song. The top bar shows:
 - `♪` during instrumental parts
 - `artist - title` when no synced lyrics are available
 
-Click the text to see the lookup status (found, not found, no timestamps, server busy…).
+Click the text to see the full lyrics, with the current line highlighted. When there are no synced lyrics, the popup shows the lookup status instead (not found, no timestamps, server busy…).
+
+Media without an album are ignored. Browsers expose a single MPRIS player for all tabs, so without this a video on X or another site would take over the top bar.
 
 ## How it works
 

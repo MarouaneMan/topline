@@ -23,8 +23,9 @@ const LEAD_MS = 500; // show each line slightly before it's sung
 const LABEL_MAX_WIDTH = 600; // px, long titles are cut with "…"
 const LYRICS_MAX_HEIGHT = 400; // px, the popup scrolls past this
 const LYRICS_WIDTH = 450; // px, long lines wrap
-const LINE_STYLE = 'color: rgba(255, 255, 255, 0.5);';
-const CURRENT_LINE_STYLE = 'color: white; font-weight: bold;';
+// Keep the theme's text color (light or dark): dim with opacity only
+const LINE_OPACITY = 110;
+const CURRENT_LINE_STYLE = 'font-weight: bold;';
 
 const STATUS = {
   fetching: 'Looking for lyrics on LRCLIB…',
@@ -212,7 +213,8 @@ export default class ToplineExtension extends Extension {
   _buildLyrics(lines) {
     this._lyricsBox.destroy_all_children();
     this._lineLabels = lines.map(line => {
-      const label = new St.Label({ text: line.text || '♪', style: LINE_STYLE });
+      const label = new St.Label({ text: line.text || '♪', opacity: LINE_OPACITY });
+      label.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
       label.clutter_text.line_wrap = true;
       this._lyricsBox.add_child(label);
       return label;
@@ -331,9 +333,17 @@ export default class ToplineExtension extends Extension {
     const i = findLineIndex(this._lines, positionMs);
     if (i === this._lineIndex)
       return;
-    this._lineLabels[this._lineIndex]?.set_style(LINE_STYLE);
+    const prev = this._lineLabels[this._lineIndex];
+    if (prev) {
+      prev.set_style(null);
+      prev.opacity = LINE_OPACITY;
+    }
     this._lineIndex = i;
-    this._lineLabels[i]?.set_style(CURRENT_LINE_STYLE);
+    const cur = this._lineLabels[i];
+    if (cur) {
+      cur.set_style(CURRENT_LINE_STYLE);
+      cur.opacity = 255;
+    }
     const text = i >= 0 ? this._lines[i].text : '';
     this._label.text = text || '♪'; // instrumental part or before first line
     if (this._button.menu.isOpen)
